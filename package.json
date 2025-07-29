@@ -1,0 +1,18 @@
+{
+  "name": "watcher",
+  "version": "1.0.0",
+  "main": "watcher.js",
+  "scripts": {
+    "start": "node watcher.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "ethers": "^6.15.0",
+    "@supabase/supabase-js": "^2.52.1",
+    "dotenv": "^17.2.1"
+  }
+}
