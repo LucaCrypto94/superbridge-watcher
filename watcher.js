@@ -34,14 +34,14 @@ const STATUS = {
   2: 'Refunded',
 };
 
-const POLL_INTERVAL = 5000; // 5 seconds
+const POLL_INTERVAL = 20000; // 20 seconds
 let lastCheckedBlock = 0;
 
 async function getStartingBlock(provider) {
   try {
     const currentBlock = await provider.getBlockNumber();
-    const startingBlock = Math.max(0, currentBlock - 1000);
-    console.log(`📊 Starting from block ${startingBlock} (last 1000 blocks)`);
+    const startingBlock = Math.max(0, currentBlock - 50);
+    console.log(`📊 Starting from block ${startingBlock} (last 50 blocks)`);
     return startingBlock;
   } catch (err) {
     console.error('❌ Error getting starting block:', err);
@@ -71,7 +71,7 @@ async function main() {
   setInterval(async () => {
     try {
       const currentBlock = await l2Provider.getBlockNumber();
-      const startingBlock = Math.max(0, currentBlock - 1000);
+      const startingBlock = Math.max(0, currentBlock - 50);
 
       // Query for BridgeInitiated events in chunks of 500 blocks (RPC limit)
       const bridgeEvents = [];
@@ -182,6 +182,27 @@ async function main() {
         console.log('User:', user);
         console.log('Amount:', amount.toString());
         console.log('Block Number:', blockNumber);
+
+        // Check if already processed (already refunded in Supabase)
+        const { data: existing, error: selectError } = await supabase
+          .from('bridged_events')
+          .select('tx_id, status')
+          .eq('tx_id', transferId);
+        
+        if (selectError) {
+          console.error('❌ Supabase select error for refund check:', selectError);
+          continue;
+        }
+        
+        if (existing && existing.length > 0) {
+          if (existing[0].status === 'refunded') {
+            console.log('ℹ️ Refund already processed in Supabase:', transferId);
+            continue;
+          }
+        } else {
+          console.log('⚠️ Transfer not found in Supabase for refund:', transferId);
+          continue;
+        }
 
         // Update Supabase status to 'refunded'
         const { error: updateError } = await supabase
