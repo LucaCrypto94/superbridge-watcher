@@ -49,8 +49,8 @@ let lastCheckedBlock = 0;
 async function getStartingBlock(provider) {
   try {
     const currentBlock = await provider.getBlockNumber();
-    const startingBlock = Math.max(0, currentBlock - 1000);
-    console.log(`📊 Starting from block ${startingBlock} (last 1000 blocks)`);
+    const startingBlock = Math.max(0, currentBlock - 200);
+    console.log(`📊 Starting from block ${startingBlock} (last 200 blocks)`);
     return startingBlock;
   } catch (err) {
     console.error('❌ Error getting starting block:', err);
@@ -145,8 +145,12 @@ async function updateSupabaseComplete(transferId, l1BlockNumber, l2TxHash, signa
 async function processPayoutCompletion(transferId, user, bridgedAmount, payoutBlockNumber) {
   try {
     console.log('🔍 Processing payout completion for transfer:', transferId);
+    console.log('🔍 User:', user);
+    console.log('🔍 Bridged Amount:', bridgedAmount.toString());
+    console.log('🔍 Payout Block Number:', payoutBlockNumber);
     
     // Get L2 transfer data for signature
+    console.log('🔍 Getting L2 transfer data...');
     const l2Provider = new ethers.JsonRpcProvider(RPC_URL);
     const l2Contract = new ethers.Contract(L2_ADDRESS, L2_COMPLETE_ABI, l2Provider);
     const transfer = await l2Contract.getTransfer(transferId);
@@ -158,9 +162,11 @@ async function processPayoutCompletion(transferId, user, bridgedAmount, payoutBl
     });
     
     // Create signature
+    console.log('🔍 Creating signature...');
     const signature = await signMessage(transferId, transfer.user, transfer.bridgedAmount, L2_ADDRESS);
     
     // Double-check status before calling complete
+    console.log('🔍 Double-checking status...');
     const doubleCheck = await l2Contract.getTransfer(transferId);
     console.log('Double-check status:', doubleCheck.status.toString());
     
@@ -177,9 +183,11 @@ async function processPayoutCompletion(transferId, user, bridgedAmount, payoutBl
     }
     
     // Call complete on L2
+    console.log('🔍 Calling complete on L2...');
     const l2TxHash = await callCompleteOnL2(transferId, user, bridgedAmount, signature);
     
     // Update Supabase with completion data
+    console.log('🔍 Updating Supabase...');
     await updateSupabaseComplete(transferId, payoutBlockNumber, l2TxHash, signature);
     
     console.log('🎉 Complete flow finished successfully!');
@@ -189,6 +197,8 @@ async function processPayoutCompletion(transferId, user, bridgedAmount, payoutBl
     
   } catch (err) {
     console.error('❌ Error processing payout completion:', err);
+    console.error('❌ Error details:', err.message);
+    console.error('❌ Error stack:', err.stack);
   }
 }
 
@@ -218,14 +228,14 @@ async function main() {
   setInterval(async () => {
     try {
       const currentBlock = await l2Provider.getBlockNumber();
-      const startingBlock = Math.max(0, currentBlock - 1000);
+      if (currentBlock <= lastCheckedBlock) return;
 
-      // Query for BridgeInitiated events in chunks of 500 blocks (RPC limit)
+      // Query for BridgeInitiated events from last checked block
       const bridgeEvents = [];
-      let fromBlock = startingBlock;
+      let fromBlock = lastCheckedBlock + 1;
       
       while (fromBlock <= currentBlock) {
-        const toBlock = Math.min(fromBlock + 499, currentBlock); // Max 500 blocks per request
+        const toBlock = Math.min(fromBlock + 499, currentBlock);
         console.log(`🔍 Querying BridgeInitiated blocks ${fromBlock} to ${toBlock}...`);
         
         const bridgeFilter = l2.filters.BridgeInitiated();
@@ -235,12 +245,12 @@ async function main() {
         fromBlock = toBlock + 1;
       }
 
-      // Query for Refunded events in chunks of 500 blocks (RPC limit)
+      // Query for Refunded events from last checked block
       const refundEvents = [];
-      fromBlock = startingBlock;
+      fromBlock = lastCheckedBlock + 1;
       
       while (fromBlock <= currentBlock) {
-        const toBlock = Math.min(fromBlock + 499, currentBlock); // Max 500 blocks per request
+        const toBlock = Math.min(fromBlock + 499, currentBlock);
         console.log(`🔍 Querying Refunded blocks ${fromBlock} to ${toBlock}...`);
         
         const refundFilter = l2.filters.Refunded();
@@ -309,19 +319,16 @@ async function main() {
           let retryCount = 0;
           const maxRetries = 3;
           let payoutSuccess = false;
+          let payoutTx = null;
           
           while (retryCount < maxRetries && !payoutSuccess) {
             try {
               console.log(`⛓️  Attempting payout (attempt ${retryCount + 1}/${maxRetries})...`);
-              const tx = await l1.payout(transferId, user, bridgedAmount);
-              console.log('⛓️  Sent payout tx:', tx.hash);
-              await tx.wait();
+              payoutTx = await l1.payout(transferId, user, bridgedAmount);
+              console.log('⛓️  Sent payout tx:', payoutTx.hash);
+              await payoutTx.wait();
               console.log('✅ Payout confirmed!');
               payoutSuccess = true;
-              
-              // Immediately start monitoring for PayoutCompleted event and complete on L2
-              console.log('🔍 Starting executor logic for completed payout...');
-              await processPayoutCompletion(transferId, user, bridgedAmount, tx.blockNumber);
             } catch (err) {
               retryCount++;
               console.error(`❌ Error processing payout (attempt ${retryCount}/${maxRetries}):`, err.message);
@@ -334,6 +341,18 @@ async function main() {
               } else {
                 console.error('❌ All payout attempts failed for transfer:', transferId);
               }
+            }
+          }
+          
+          // Complete on L2 if payout succeeded
+          if (payoutSuccess && payoutTx) {
+            console.log('🔍 Starting executor logic for completed payout...');
+            console.log('Payout TX:', payoutTx.hash);
+            console.log('Payout Block:', payoutTx.blockNumber);
+            try {
+              await processPayoutCompletion(transferId, user, bridgedAmount, payoutTx.blockNumber);
+            } catch (err) {
+              console.error('❌ Error in processPayoutCompletion:', err);
             }
           }
         } else {
@@ -369,7 +388,8 @@ async function main() {
           console.log('✅ Updated Supabase status to refunded:', transferId);
         }
       }
-
+      
+      lastCheckedBlock = currentBlock;
     } catch (err) {
       console.error('❌ Error polling for events:', err);
     }
