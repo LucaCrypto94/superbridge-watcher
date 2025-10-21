@@ -60,9 +60,12 @@ async function getStartingBlock(provider) {
 
 async function signMessage(transferId, user, bridgedAmount, contractAddress) {
   try {
+    // Convert transferId to bytes32 if it's a hex string
+    const transferIdBytes = transferId.startsWith('0x') ? transferId : '0x' + transferId;
+    
     const rawHash = ethers.keccak256(ethers.solidityPacked(
       ['bytes32', 'address', 'uint256', 'address'],
-      [transferId, user, bridgedAmount, contractAddress]
+      [transferIdBytes, user, bridgedAmount, contractAddress]
     ));
     
     const signer = new ethers.Wallet(SIGNER_KEY);
@@ -326,9 +329,10 @@ async function main() {
               console.log(`⛓️  Attempting payout (attempt ${retryCount + 1}/${maxRetries})...`);
               payoutTx = await l1.payout(transferId, user, bridgedAmount);
               console.log('⛓️  Sent payout tx:', payoutTx.hash);
-              await payoutTx.wait();
+              const receipt = await payoutTx.wait();
               console.log('✅ Payout confirmed!');
               payoutSuccess = true;
+              payoutTx.blockNumber = receipt.blockNumber; // Get block number from receipt
             } catch (err) {
               retryCount++;
               console.error(`❌ Error processing payout (attempt ${retryCount}/${maxRetries}):`, err.message);
