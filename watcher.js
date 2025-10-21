@@ -4,13 +4,17 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Load environment variables
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const SIGNER_KEY = process.env.SIGNER_KEY;
 const L2_ADDRESS = process.env.NEXT_PUBLIC_SUPERBRIDGE_L2_ADDRESS;
 const L1_ADDRESS = process.env.NEXT_PUBLIC_SUPERBRIDGE_L1_ADDRESS;
 const RPC_URL = "https://rpc-pepu-v2-mainnet-0.t.conduit.xyz";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_API_KEY = process.env.SUPABASE_API_KEY;
 
-if (!PRIVATE_KEY || !L2_ADDRESS || !L1_ADDRESS || !SUPABASE_URL || !SUPABASE_API_KEY || !process.env.ETHEREUM_RPC_URL) {
+// The authorized signer address (from your contract)
+const AUTHORIZED_SIGNER = "0x9e09fd3f7Bf43E68A1C813e02d0f5da519AaEbEd";
+
+if (!PRIVATE_KEY || !SIGNER_KEY || !L2_ADDRESS || !L1_ADDRESS || !SUPABASE_URL || !SUPABASE_API_KEY || !process.env.ETHEREUM_RPC_URL) {
   console.error('❌ Missing environment variables. Please check your .env file.');
   process.exit(1);
 }
@@ -25,6 +29,11 @@ const L2_ABI = [
 ];
 const L1_ABI = [
   "function payout(bytes32 transferId, address user, uint256 bridgedAmount) external"
+];
+
+const L2_COMPLETE_ABI = [
+  "function complete(bytes32 transferId, bytes[] calldata signatures, address[] calldata signers) external",
+  "function getTransfer(bytes32 transferId) external view returns (tuple(address user, uint256 originalAmount, uint256 bridgedAmount, uint256 timestamp, uint8 status))"
 ];
 
 // Status enum mapping (from contract)
@@ -49,16 +58,151 @@ async function getStartingBlock(provider) {
   }
 }
 
+async function signMessage(transferId, user, bridgedAmount, contractAddress) {
+  try {
+    const rawHash = ethers.keccak256(ethers.solidityPacked(
+      ['bytes32', 'address', 'uint256', 'address'],
+      [transferId, user, bridgedAmount, contractAddress]
+    ));
+    
+    const signer = new ethers.Wallet(SIGNER_KEY);
+    const signature = await signer.signMessage(ethers.getBytes(rawHash));
+    
+    console.log('✅ Message signed successfully');
+    console.log('Transfer ID:', transferId);
+    console.log('User:', user);
+    console.log('Bridged Amount:', bridgedAmount.toString());
+    console.log('Signature:', signature);
+    
+    return signature;
+  } catch (err) {
+    console.error('❌ Error signing message:', err);
+    throw err;
+  }
+}
+
+async function callCompleteOnL2(transferId, user, bridgedAmount, signature) {
+  try {
+    const l2Provider = new ethers.JsonRpcProvider(RPC_URL);
+    const l2Wallet = new ethers.Wallet(SIGNER_KEY, l2Provider);
+    const l2Contract = new ethers.Contract(L2_ADDRESS, L2_COMPLETE_ABI, l2Wallet);
+    
+    console.log('🔑 Executor wallet address:', l2Wallet.address);
+    console.log('🔑 Expected authorized signer:', AUTHORIZED_SIGNER);
+    
+    console.log('⛓️ Calling complete on L2...');
+    console.log('Transfer ID:', transferId);
+    console.log('User:', user);
+    console.log('Bridged Amount:', bridgedAmount.toString());
+    
+    const tx = await l2Contract.complete(
+      transferId,
+      [signature],
+      [AUTHORIZED_SIGNER]
+    );
+    
+    console.log('⏳ Waiting for L2 transaction confirmation...');
+    await tx.wait();
+    
+    console.log('✅ L2 complete transaction confirmed!');
+    console.log('Transaction hash:', tx.hash);
+    
+    return tx.hash;
+  } catch (err) {
+    console.error('❌ Error calling complete on L2:', err);
+    throw err;
+  }
+}
+
+async function updateSupabaseComplete(transferId, l1BlockNumber, l2TxHash, signature) {
+  try {
+    const updateData = {
+      status: 'Completed',
+      l1_block_number: l1BlockNumber,
+      signature1: signature
+    };
+    
+    const { error } = await supabase
+      .from('bridged_events')
+      .update(updateData)
+      .eq('tx_id', transferId);
+    
+    if (error) {
+      console.error('❌ Error updating Supabase completion data:', error);
+      throw error;
+    }
+    
+    console.log('✅ Supabase updated with completion data:');
+    console.log('  - Status: Completed');
+    console.log('  - L1 Block Number:', l1BlockNumber);
+    console.log('  - Signature1:', signature);
+  } catch (err) {
+    console.error('❌ Error updating Supabase completion data:', err);
+    throw err;
+  }
+}
+
+async function processPayoutCompletion(transferId, user, bridgedAmount, payoutBlockNumber) {
+  try {
+    console.log('🔍 Processing payout completion for transfer:', transferId);
+    
+    // Get L2 transfer data for signature
+    const l2Provider = new ethers.JsonRpcProvider(RPC_URL);
+    const l2Contract = new ethers.Contract(L2_ADDRESS, L2_COMPLETE_ABI, l2Provider);
+    const transfer = await l2Contract.getTransfer(transferId);
+    
+    console.log('L2 Transfer data:', {
+      user: transfer.user,
+      bridgedAmount: transfer.bridgedAmount.toString(),
+      status: transfer.status.toString()
+    });
+    
+    // Create signature
+    const signature = await signMessage(transferId, transfer.user, transfer.bridgedAmount, L2_ADDRESS);
+    
+    // Double-check status before calling complete
+    const doubleCheck = await l2Contract.getTransfer(transferId);
+    console.log('Double-check status:', doubleCheck.status.toString());
+    
+    // Status enum: Pending=0, Completed=1, Refunded=2
+    if (doubleCheck.status === 1n || doubleCheck.status === 1) {
+      console.log('❌ Transfer already completed (status=1), skipping...');
+      return;
+    } else if (doubleCheck.status === 2n || doubleCheck.status === 2) {
+      console.log('❌ Transfer was refunded (status=2), skipping...');
+      return;
+    } else if (doubleCheck.status !== 0n && doubleCheck.status !== 0) {
+      console.log('❌ Transfer has unknown status, skipping...');
+      return;
+    }
+    
+    // Call complete on L2
+    const l2TxHash = await callCompleteOnL2(transferId, user, bridgedAmount, signature);
+    
+    // Update Supabase with completion data
+    await updateSupabaseComplete(transferId, payoutBlockNumber, l2TxHash, signature);
+    
+    console.log('🎉 Complete flow finished successfully!');
+    console.log('L1 Payout Block:', payoutBlockNumber);
+    console.log('L2 Complete Tx:', l2TxHash);
+    console.log('Supabase Status: completed');
+    
+  } catch (err) {
+    console.error('❌ Error processing payout completion:', err);
+  }
+}
+
 async function main() {
-  const l2Provider = new ethers.JsonRpcProvider(RPC_URL); // PEPU_TESTNET_RPC for L2
-  const l1Provider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC_URL); // ETHEREUM_RPC_URL for L1
+  const l2Provider = new ethers.JsonRpcProvider(RPC_URL);
+  const l1Provider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC_URL);
   const l1Wallet = new ethers.Wallet(PRIVATE_KEY, l1Provider);
 
   const l2 = new ethers.Contract(L2_ADDRESS, L2_ABI, l2Provider);
   const l1 = new ethers.Contract(L1_ADDRESS, L1_ABI, l1Wallet);
 
-  // Get starting block (always last 300 blocks)
+  // Get starting block
   const startingBlock = await getStartingBlock(l2Provider);
+  
   if (startingBlock === null) {
     console.error('❌ Failed to determine starting block. Exiting.');
     process.exit(1);
@@ -66,7 +210,10 @@ async function main() {
   
   lastCheckedBlock = startingBlock;
 
-  console.log('⏳ Polling for BridgeInitiated events on L2:', L2_ADDRESS);
+  console.log('⏳ Unified Watcher+Executor started!');
+  console.log('L2 Contract:', L2_ADDRESS);
+  console.log('L1 Contract:', L1_ADDRESS);
+  console.log('Authorized Signer:', AUTHORIZED_SIGNER);
 
   setInterval(async () => {
     try {
@@ -171,6 +318,10 @@ async function main() {
               await tx.wait();
               console.log('✅ Payout confirmed!');
               payoutSuccess = true;
+              
+              // Immediately start monitoring for PayoutCompleted event and complete on L2
+              console.log('🔍 Starting executor logic for completed payout...');
+              await processPayoutCompletion(transferId, user, bridgedAmount, tx.blockNumber);
             } catch (err) {
               retryCount++;
               console.error(`❌ Error processing payout (attempt ${retryCount}/${maxRetries}):`, err.message);
@@ -218,6 +369,7 @@ async function main() {
           console.log('✅ Updated Supabase status to refunded:', transferId);
         }
       }
+
     } catch (err) {
       console.error('❌ Error polling for events:', err);
     }
