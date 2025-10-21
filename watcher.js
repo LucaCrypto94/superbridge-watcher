@@ -34,14 +34,14 @@ const STATUS = {
   2: 'Refunded',
 };
 
-const POLL_INTERVAL = 20000; // 20 seconds
+const POLL_INTERVAL = 5000; // 5 seconds
 let lastCheckedBlock = 0;
 
 async function getStartingBlock(provider) {
   try {
     const currentBlock = await provider.getBlockNumber();
-    const startingBlock = Math.max(0, currentBlock - 50);
-    console.log(`📊 Starting from block ${startingBlock} (last 50 blocks)`);
+    const startingBlock = Math.max(0, currentBlock - 1000);
+    console.log(`📊 Starting from block ${startingBlock} (last 1000 blocks)`);
     return startingBlock;
   } catch (err) {
     console.error('❌ Error getting starting block:', err);
@@ -71,7 +71,7 @@ async function main() {
   setInterval(async () => {
     try {
       const currentBlock = await l2Provider.getBlockNumber();
-      const startingBlock = Math.max(0, currentBlock - 50);
+      const startingBlock = Math.max(0, currentBlock - 1000);
 
       // Query for BridgeInitiated events in chunks of 500 blocks (RPC limit)
       const bridgeEvents = [];
@@ -158,18 +158,39 @@ async function main() {
             console.log('✅ Added to Supabase (Pending):', transferId);
           }
 
-          // Call payout for Pending transactions
-          try {
-            const tx = await l1.payout(transferId, user, bridgedAmount);
-            console.log('⛓️  Sent payout tx:', tx.hash);
-            await tx.wait();
-            console.log('✅ Payout confirmed!');
-          } catch (err) {
-            console.error('❌ Error processing payout:', err);
+          // Call payout for Pending transactions with retry logic
+          let retryCount = 0;
+          const maxRetries = 3;
+          let payoutSuccess = false;
+          
+          while (retryCount < maxRetries && !payoutSuccess) {
+            try {
+              console.log(`⛓️  Attempting payout (attempt ${retryCount + 1}/${maxRetries})...`);
+              const tx = await l1.payout(transferId, user, bridgedAmount);
+              console.log('⛓️  Sent payout tx:', tx.hash);
+              await tx.wait();
+              console.log('✅ Payout confirmed!');
+              payoutSuccess = true;
+            } catch (err) {
+              retryCount++;
+              console.error(`❌ Error processing payout (attempt ${retryCount}/${maxRetries}):`, err.message);
+              
+              if (retryCount < maxRetries) {
+                // Wait before retry (exponential backoff)
+                const waitTime = Math.pow(2, retryCount) * 1000; // 2s, 4s, 8s
+                console.log(`⏳ Waiting ${waitTime}ms before retry...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+              } else {
+                console.error('❌ All payout attempts failed for transfer:', transferId);
+              }
+            }
           }
         } else {
           console.log('⏩ Skipping: status is not Pending (0). Status:', statusStr);
         }
+        
+        // Add delay between events to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
       }
 
       // Process Refunded events
@@ -182,27 +203,6 @@ async function main() {
         console.log('User:', user);
         console.log('Amount:', amount.toString());
         console.log('Block Number:', blockNumber);
-
-        // Check if already processed (already refunded in Supabase)
-        const { data: existing, error: selectError } = await supabase
-          .from('bridged_events')
-          .select('tx_id, status')
-          .eq('tx_id', transferId);
-        
-        if (selectError) {
-          console.error('❌ Supabase select error for refund check:', selectError);
-          continue;
-        }
-        
-        if (existing && existing.length > 0) {
-          if (existing[0].status === 'refunded') {
-            console.log('ℹ️ Refund already processed in Supabase:', transferId);
-            continue;
-          }
-        } else {
-          console.log('⚠️ Transfer not found in Supabase for refund:', transferId);
-          continue;
-        }
 
         // Update Supabase status to 'refunded'
         const { error: updateError } = await supabase
