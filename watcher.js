@@ -69,7 +69,7 @@ async function signMessage(transferId, user, bridgedAmount, contractAddress) {
     ));
     
     const signer = new ethers.Wallet(SIGNER_KEY);
-    const signature = await signer.signMessage(rawHash);
+    const signature = await signer.signMessage(ethers.getBytes(rawHash));
     
     console.log('✅ Message signed successfully');
     console.log('Transfer ID:', transferId);
